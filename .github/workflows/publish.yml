@@ -33,11 +33,14 @@ jobs:
         run: |
           [[ "$DIST_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-flatpak\.[1-9][0-9]*$ ]]
           mkdir -p work/assets work/public
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$DIST_TAG" > work/distribution.json
+          gh release view "$DIST_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,name,tagName > work/distribution.json
           python3 - <<'PY'
           import json
           release=json.load(open('work/distribution.json'))
-          assert release['draft'], 'A published distribution tag must never be overwritten'
+          import os
+          assert release['isDraft'], 'A published distribution tag must never be overwritten'
+          assert release['tagName']==os.environ['DIST_TAG']
+          assert release['name']=='Naviamp '+os.environ['DIST_TAG'].split('-flatpak.')[0]
           PY
           gh release download "$DIST_TAG" --repo "$GITHUB_REPOSITORY" --dir work/assets
           release_tag=${DIST_TAG%-flatpak.*}
