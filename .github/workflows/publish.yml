@@ -1,0 +1,103 @@
+name: Publish Flatpak
+on:
+  workflow_dispatch:
+    inputs:
+      distribution_tag:
+        description: Draft containing locally signed public assets (vX.Y.Z-flatpak.N)
+        required: true
+        type: string
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: flatpak-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DIST_TAG: ${{ inputs.distribution_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: goosepod/naviamp
+          ref: main
+          path: source
+      - name: Validate distribution and download public assets
+        run: |
+          [[ "$DIST_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-flatpak\.[1-9][0-9]*$ ]]
+          mkdir -p work/assets work/public
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$DIST_TAG" > work/distribution.json
+          python3 - <<'PY'
+          import json
+          release=json.load(open('work/distribution.json'))
+          assert release['draft'], 'A published distribution tag must never be overwritten'
+          PY
+          gh release download "$DIST_TAG" --repo "$GITHUB_REPOSITORY" --dir work/assets
+          release_tag=${DIST_TAG%-flatpak.*}
+          gh api "repos/goosepod/naviamp/releases/tags/$release_tag" > work/release.json
+          python3 - <<'PY'
+          from pathlib import Path
+          for line in Path('work/assets/SHA256SUMS').read_text().splitlines():
+              digest,name=line.split('  ',1)
+              assert len(digest)==64 and all(c in '0123456789abcdef' for c in digest)
+              assert Path(name).name==name and name not in ('.','..')
+          PY
+          (cd work/assets && sha256sum -c SHA256SUMS)
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          zstd -d work/assets/pages.tar.zst -o work/pages.tar
+          python3 - <<'PY'
+          import tarfile
+          with tarfile.open('work/pages.tar') as archive:
+              archive.extractall('work/public', filter='data')
+          PY
+          python3 source/scripts/flatpak/verify_public.py --public work/public --source work/assets/source.json --release-json work/release.json
+      - name: Install sandbox acceptance tools
+        run: |
+          sudo apt-get install -y flatpak gnome-keyring libsecret-tools dbus-x11 xvfb \
+            xdotool imagemagick pulseaudio pulseaudio-utils flac
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive --assumeyes flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
+      - name: Test the signed application before publication
+        run: |
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=naviamp_flatpak_test
+          pactl set-default-sink naviamp_flatpak_test
+          xvfb-run -a --server-args='-screen 0 1280x900x24 +extension GLX' dbus-run-session -- \
+            bash source/scripts/flatpak/smoke.sh "$PWD/work/public/repo" "$RUNNER_TEMP/flatpak-smoke"
+      - name: Retain acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: flatpak-acceptance
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/flatpak-smoke/application.png
+            ${{ runner.temp }}/flatpak-smoke/application.log
+            ${{ runner.temp }}/flatpak-smoke/native-audio.txt
+            ${{ runner.temp }}/flatpak-smoke/mpris.txt
+            ${{ runner.temp }}/flatpak-smoke/permissions.txt
+            work/assets/source.json
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: work/public
+      - name: Deploy signed remote
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Verify public installer and signed metadata
+        run: |
+          curl --fail --retry 5 --retry-delay 5 https://goosepod.com/naviamp-flatpak/Naviamp.flatpakref -o work/public.flatpakref
+          cmp work/public.flatpakref work/assets/Naviamp.flatpakref
+          flatpak remote-add --user --gpg-import=source/packaging/flatpak/naviamp.asc naviamp-public https://goosepod.com/naviamp-flatpak/repo/
+          flatpak remote-info --user naviamp-public io.github.goosepod.Naviamp
+      - name: Make the verified distribution release available
+        run: gh release edit "$DIST_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
